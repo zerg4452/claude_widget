@@ -1,0 +1,8 @@
+# Per-PC settings and personal usage snapshot
+config.ini
+claude-usage.json
+*.tmp
+
+# Build output
+*.exe
+dist/
