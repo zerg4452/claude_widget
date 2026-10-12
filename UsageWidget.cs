@@ -39,7 +39,7 @@ namespace UsageWidget
         public bool HasData { get { return Short.UsedPct >= 0 || Week.UsedPct >= 0; } }
     }
 
-    // Claude output speed, measured per API request from the session transcripts.
+    // Output speed, measured per request from the session transcripts.
     public class Tps
     {
         public double Last = -1;
@@ -63,6 +63,8 @@ namespace UsageWidget
 
     public class SessionTurn
     {
+        public string AI = "Claude";
+        public string SessionId, SessionTitle;
         public string Path, Title, Project;
         public DateTime Start, End; // local; End is MinValue while running
         public bool Interrupted, Abandoned;
@@ -236,6 +238,325 @@ namespace UsageWidget
             catch { }
             return u;
         }
+
+        class CodexParsed
+        {
+            public long Offset, Total = -1;
+            public DateTime Mtime, Start, End, Anchor, ResponseEnd, NextAnchor;
+            public string TurnId, Path, Title, Project, SessionId;
+            public bool Subagent, Interrupted;
+            public List<SessionTurn> Completed = new List<SessionTurn>();
+            public List<Req> Reqs = new List<Req>();
+        }
+
+        static readonly Dictionary<string, CodexParsed> codexCache = new Dictionary<string, CodexParsed>(StringComparer.OrdinalIgnoreCase);
+        static readonly System.Web.Script.Serialization.JavaScriptSerializer json = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+
+        static Dictionary<string, object> Map(Dictionary<string, object> obj, string key)
+        {
+            object value;
+            return obj != null && obj.TryGetValue(key, out value) ? value as Dictionary<string, object> : null;
+        }
+
+        static string Str(Dictionary<string, object> obj, string key)
+        {
+            object value;
+            return obj != null && obj.TryGetValue(key, out value) ? value as string : null;
+        }
+
+        static DateTime CodexTime(string value)
+        {
+            DateTime t;
+            return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out t) ? t : DateTime.MinValue;
+        }
+
+        static DateTime CodexTime(Dictionary<string, object> obj, string key)
+        {
+            object value;
+            if (!obj.TryGetValue(key, out value) || value == null) return DateTime.MinValue;
+            string text = Convert.ToString(value, CultureInfo.InvariantCulture);
+            long seconds;
+            if (!long.TryParse(text, out seconds)) return CodexTime(text);
+            try { return DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime; }
+            catch (ArgumentOutOfRangeException) { return DateTime.MinValue; }
+        }
+
+        static void CodexLine(CodexParsed p, string line)
+        {
+            // The envelope, rather than text embedded in a tool result, determines the event type.
+            Dictionary<string, object> e = json.DeserializeObject(line) as Dictionary<string, object>;
+            Dictionary<string, object> payload = Map(e, "payload");
+            if (payload == null) return;
+            string kind = Str(e, "type"), type = Str(payload, "type");
+            if (kind == "session_meta")
+            {
+                Dictionary<string, object> source = Map(payload, "source");
+                p.Subagent = source != null && source.ContainsKey("subagent");
+                p.SessionId = Str(payload, "id");
+                string cwd = Str(payload, "cwd");
+                if (!string.IsNullOrEmpty(cwd)) p.Project = System.IO.Path.GetFileName(cwd.TrimEnd('\\', '/'));
+                return;
+            }
+            if (p.Subagent) return;
+            DateTime ts = CodexTime(Str(e, "timestamp"));
+            if (ts == DateTime.MinValue) return;
+            if (kind == "event_msg")
+            {
+                if (type == "task_started")
+                {
+                    p.Start = CodexTime(payload, "started_at");
+                    if (p.Start == DateTime.MinValue) p.Start = ts;
+                    p.End = p.ResponseEnd = p.NextAnchor = DateTime.MinValue;
+                    p.Anchor = p.Start;
+                    p.TurnId = Str(payload, "turn_id");
+                    p.Interrupted = false;
+                    p.Title = null;
+                }
+                else if (type == "task_complete" || type == "task_completed" || type == "turn_aborted")
+                {
+                    string id = Str(payload, "turn_id");
+                    if (p.Start != DateTime.MinValue && p.End == DateTime.MinValue && (id == null || p.TurnId == null || id == p.TurnId))
+                    {
+                        p.End = CodexTime(payload, "completed_at");
+                        if (p.End == DateTime.MinValue) p.End = ts;
+                        if (p.End < p.Start) p.End = p.Start;
+                        p.Anchor = DateTime.MinValue;
+                        p.Interrupted = type == "turn_aborted";
+                        p.Completed.Add(CodexTurn(p, p.End, false));
+                        if (p.Completed.Count > 32) p.Completed.RemoveAt(0);
+                    }
+                }
+                else if (type == "user_message" && string.IsNullOrEmpty(p.Title))
+                {
+                    SetCodexTitle(p, Str(payload, "message"));
+                }
+                else if (type == "token_count")
+                {
+                    Dictionary<string, object> usage = Map(Map(payload, "info"), "total_token_usage");
+                    object value;
+                    long total;
+                    if (usage == null || !usage.TryGetValue("output_tokens", out value)
+                        || !long.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out total) || total < 0) return;
+                    if (total == p.Total) return; // Repeated quota-only snapshots must not count twice.
+                    Dictionary<string, object> last = Map(Map(payload, "info"), "last_token_usage");
+                    long tokens = 0;
+                    if (last != null && last.TryGetValue("output_tokens", out value))
+                        long.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out tokens);
+                    if (p.Total >= 0 && total > p.Total) tokens = total - p.Total;
+                    DateTime end = p.ResponseEnd != DateTime.MinValue ? p.ResponseEnd : ts;
+                    double secs = (end - p.Anchor).TotalSeconds;
+                    // token_count can be written after tool output: use the preceding response end.
+                    if (p.Total <= total && tokens > 0 && p.Anchor != DateTime.MinValue && secs >= 0.5 && secs <= 900)
+                        p.Reqs.Add(new Req { Start = p.Anchor, End = end, Tokens = tokens, Done = true });
+                    p.Total = total;
+                    p.Anchor = p.NextAnchor > end ? p.NextAnchor : ts;
+                    p.ResponseEnd = p.NextAnchor = DateTime.MinValue;
+                }
+            }
+            else if (kind == "response_item")
+            {
+                if (type == "message" && Str(payload, "role") == "user")
+                {
+                    Dictionary<string, object> meta = Map(payload, "internal_chat_message_metadata_passthrough");
+                    string turn = Str(meta, "turn_id");
+                    if (turn != null && p.TurnId != null && turn != p.TurnId) return;
+                    object value;
+                    if (meta != null && meta.TryGetValue("content_item_kinds", out value))
+                    {
+                        object[] kinds = value as object[];
+                        if (kinds == null || Array.IndexOf(kinds, "user.text") < 0) return;
+                    }
+                    if (payload.TryGetValue("content", out value))
+                    {
+                        object[] content = value as object[];
+                        if (content != null)
+                        {
+                            StringBuilder text = new StringBuilder();
+                            foreach (object item in content)
+                            {
+                                Dictionary<string, object> block = item as Dictionary<string, object>;
+                                if (Str(block, "type") == "input_text") text.AppendLine(Str(block, "text"));
+                            }
+                            SetCodexTitle(p, text.ToString());
+                        }
+                    }
+                }
+                else if (type == "function_call_output" || type == "custom_tool_call_output")
+                    p.NextAnchor = ts;
+                else if (type == "function_call" || type == "custom_tool_call" || (type == "message" && Str(payload, "role") == "assistant"))
+                {
+                    if (p.ResponseEnd == DateTime.MinValue && p.NextAnchor > p.Anchor)
+                    {
+                        p.Anchor = p.NextAnchor;
+                        p.NextAnchor = DateTime.MinValue;
+                    }
+                    p.ResponseEnd = ts;
+                }
+            }
+        }
+
+        static void SetCodexTitle(CodexParsed p, string text)
+        {
+            if (p.Start == DateTime.MinValue || p.End != DateTime.MinValue || !string.IsNullOrEmpty(p.Title) || string.IsNullOrWhiteSpace(text)) return;
+            text = text.Trim();
+            if (text.StartsWith("# AGENTS.md instructions", StringComparison.Ordinal)
+                || text.StartsWith("<environment_context>", StringComparison.Ordinal)
+                || text.StartsWith("<external_codex_apps_open_page>", StringComparison.Ordinal)
+                || text.StartsWith("<send_user_message_question_reply>", StringComparison.Ordinal)
+                || text.StartsWith("<user_instructions>", StringComparison.Ordinal)) return;
+            text = Regex.Replace(text, "\\s+", " ");
+            p.Title = text.Length > 80 ? text.Substring(0, 80) + "…" : text;
+        }
+
+        static CodexParsed ReadCodexCached(FileInfo fi)
+        {
+            CodexParsed p;
+            if (!codexCache.TryGetValue(fi.FullName, out p) || fi.Length < p.Offset
+                || (fi.Length == p.Offset && fi.LastWriteTimeUtc != p.Mtime))
+                codexCache[fi.FullName] = p = new CodexParsed();
+            p.Path = fi.FullName;
+            if (p.Offset == fi.Length && p.Mtime == fi.LastWriteTimeUtc) return p;
+            using (FileStream fs = new FileStream(fi.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (MemoryStream line = new MemoryStream())
+            {
+                fs.Position = p.Offset;
+                long position = p.Offset, limit = fs.Length;
+                byte[] buffer = new byte[65536];
+                while (position < limit)
+                {
+                    int count = fs.Read(buffer, 0, (int)Math.Min(buffer.Length, limit - position));
+                    if (count == 0) break;
+                    int start = 0;
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (buffer[i] != 10) continue;
+                        line.Write(buffer, start, i - start);
+                        try { CodexLine(p, Encoding.UTF8.GetString(line.GetBuffer(), 0, (int)line.Length).TrimStart('\uFEFF')); }
+                        catch (ArgumentException) { } // A malformed complete line must not hide later events.
+                        catch (InvalidOperationException) { }
+                        line.SetLength(0);
+                        start = i + 1;
+                        p.Offset = position + start;
+                    }
+                    line.Write(buffer, start, count - start);
+                    position += count;
+                }
+                // Leave an incomplete final UTF-8/JSON line unread until the writer finishes it.
+            }
+            p.Mtime = fi.LastWriteTimeUtc;
+            if (p.Reqs.Count > 256) p.Reqs.RemoveRange(0, p.Reqs.Count - 256);
+            return p;
+        }
+
+        static SessionTurn CodexTurn(CodexParsed p, DateTime end, bool abandoned)
+        {
+            return new SessionTurn { AI = "Codex", SessionId = p.SessionId, Path = p.Path, Title = p.Title, Project = p.Project,
+                Start = p.Start.ToLocalTime(), End = end == DateTime.MinValue ? end : end.ToLocalTime(),
+                Interrupted = p.Interrupted, Abandoned = abandoned };
+        }
+
+        static Dictionary<string, string> ReadCodexSessionNames(string sessionsDir)
+        {
+            Dictionary<string, string> names = new Dictionary<string, string>(StringComparer.Ordinal);
+            try
+            {
+                string home = Path.GetDirectoryName(sessionsDir.TrimEnd('\\', '/'));
+                if (string.IsNullOrEmpty(home)) return names;
+                string path = Path.Combine(home, "session_index.jsonl");
+                if (!File.Exists(path)) return names;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader reader = new StreamReader(fs, Encoding.UTF8))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        try
+                        {
+                            Dictionary<string, object> entry = json.DeserializeObject(line) as Dictionary<string, object>;
+                            string id = Str(entry, "id"), name = Str(entry, "thread_name");
+                            if (!string.IsNullOrEmpty(id) && !string.IsNullOrWhiteSpace(name)) names[id] = name.Trim();
+                        }
+                        catch (ArgumentException) { }
+                        catch (InvalidOperationException) { }
+                    }
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            return names;
+        }
+
+        public static Tps ReadCodexTps(string sessionsDir)
+        {
+            Tps t = new Tps();
+            try
+            {
+                List<string> files = RecentFiles(sessionsDir, 14);
+                files.Sort(delegate(string a, string b) { return File.GetLastWriteTimeUtc(b).CompareTo(File.GetLastWriteTimeUtc(a)); });
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                Req last = null;
+                long sumTokens = 0;
+                double sumSeconds = 0;
+                DateTime now = DateTime.UtcNow;
+                bool activeSelected = false;
+                int mainCount = 0;
+                foreach (string file in files)
+                {
+                    FileInfo fi = new FileInfo(file);
+                    if (mainCount >= 8 || fi.LastWriteTimeUtc < now.AddDays(-1)) break;
+                    try
+                    {
+                        CodexParsed p = ReadCodexCached(fi);
+                        seen.Add(file);
+                        if (p.Subagent) continue;
+                        mainCount++;
+                        t.Sessions.AddRange(p.Completed);
+                        DateTime end = p.End;
+                        if (end == DateTime.MinValue && now - fi.LastWriteTimeUtc > TimeSpan.FromMinutes(30)) end = fi.LastWriteTimeUtc;
+                        bool active = p.Start != DateTime.MinValue && end == DateTime.MinValue;
+                        if (p.Start != DateTime.MinValue && p.End == DateTime.MinValue)
+                            t.Sessions.Add(CodexTurn(p, end, end != DateTime.MinValue));
+                        if (p.Start != DateTime.MinValue && ((!activeSelected && active) || (activeSelected == active && p.Start.ToLocalTime() > t.TurnStart)))
+                        {
+                            t.TurnStart = p.Start.ToLocalTime();
+                            t.TurnEnd = end == DateTime.MinValue ? end : end.ToLocalTime();
+                            activeSelected = active;
+                        }
+                        foreach (Req r in p.Reqs)
+                        {
+                            if (last == null || r.End > last.End) last = r;
+                            if (r.End < now.AddMinutes(-Tps.AvgMinutes)) continue;
+                            sumTokens += r.Tokens;
+                            sumSeconds += (r.End - r.Start).TotalSeconds;
+                            t.AvgCount++;
+                        }
+                    }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+                List<string> stale = new List<string>();
+                foreach (string key in codexCache.Keys) if (!seen.Contains(key)) stale.Add(key);
+                foreach (string key in stale) codexCache.Remove(key);
+                if (last != null)
+                {
+                    t.LastTokens = last.Tokens;
+                    t.LastSecs = (last.End - last.Start).TotalSeconds;
+                    t.Last = t.LastTokens / t.LastSecs;
+                    t.LastAt = last.End.ToLocalTime();
+                }
+                if (sumSeconds > 0) t.Avg = sumTokens / sumSeconds;
+                Dictionary<string, string> sessionNames = ReadCodexSessionNames(sessionsDir);
+                foreach (SessionTurn session in t.Sessions)
+                {
+                    string name;
+                    session.SessionTitle = session.SessionId != null && sessionNames.TryGetValue(session.SessionId, out name) ? name : null;
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            return t;
+        }
+
 
         class Req
         {
@@ -520,9 +841,11 @@ namespace UsageWidget
         Usage claude = new Usage(), codex = new Usage();
         Usage claudeApi;  // last successful OAuth usage fetch
         int apiBusy = 0;
-        Tps claudeTps = new Tps();
+        Tps claudeTps = new Tps(), codexTps = new Tps();
         const int ModeShort = 0, ModeWeek = 1, ModeBoth = 2;
         int limitMode = ModeBoth;
+        bool vertical = false; // one row per AI instead of a single row
+        ToolStripMenuItem miHorizontal, miVertical;
         bool showUsed = false, hover = false;
         // Appearance: text color follows the taskbar theme unless set; background is off at 0% opacity.
         Color? customFg = null;
@@ -534,7 +857,7 @@ namespace UsageWidget
         // Turn-finished notifications: one per (session, turn), only for turns ending after launch.
         bool notifyOn = true, notifySound = false, notifyBlink = true;
         readonly DateTime launchedAt = DateTime.Now;
-        readonly Dictionary<string, DateTime> notifiedTurn = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        readonly HashSet<string> notifiedTurn = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         readonly List<ToastForm> toasts = new List<ToastForm>();
         ToolStripMenuItem miNotify, miNotifySound, miNotifyBlink, miToastSize;
         float toastZoom = 1f; // card size, independent of the widget's own zoom
@@ -592,7 +915,7 @@ namespace UsageWidget
             // Redraw every second while a turn is running so the elapsed time ticks.
             tickTimer = new System.Windows.Forms.Timer();
             tickTimer.Interval = 1000;
-            tickTimer.Tick += delegate { if (showTps && claudeTps.TurnActive && Visible) Render(); };
+            tickTimer.Tick += delegate { if (showTps && ((showClaude && claudeTps.TurnActive) || (showCodex && codexTps.TurnActive)) && Visible) Render(); };
 
             SystemEvents.DisplaySettingsChanged += delegate { ClampToScreen(); Render(); };
         }
@@ -739,7 +1062,7 @@ namespace UsageWidget
             miShow.DropDownItems.Add(miShowClaude);
             miShow.DropDownItems.Add(miShowCodex);
             miShow.DropDownItems.Add(new ToolStripSeparator());
-            miShowTps = new ToolStripMenuItem("Claude 출력 속도·작업시간", null, delegate { showTps = !showTps; SaveConfig(); UpdateMenu(); RefreshData(); });
+            miShowTps = new ToolStripMenuItem("출력 속도·작업시간 (Claude / Codex)", null, delegate { showTps = !showTps; SaveConfig(); UpdateMenu(); RefreshData(); });
             miShow.DropDownItems.Add(miShowTps);
             ToolStripMenuItem miNotifyRoot = new ToolStripMenuItem("작업 완료 알림");
             miNotify = new ToolStripMenuItem("알림 켜기", null, delegate { notifyOn = !notifyOn; SaveConfig(); UpdateMenu(); RefreshData(); });
@@ -794,6 +1117,11 @@ namespace UsageWidget
                 miOpacity.DropDownItems.Add(mi);
             }
             miLook.DropDownItems.Add(miOpacity);
+            miLook.DropDownItems.Add(new ToolStripSeparator());
+            miHorizontal = new ToolStripMenuItem("가로 배치", null, delegate { vertical = false; ApplyLook(); });
+            miVertical = new ToolStripMenuItem("세로 배치 (AI별 한 줄)", null, delegate { vertical = true; ApplyLook(); });
+            miLook.DropDownItems.Add(miHorizontal);
+            miLook.DropDownItems.Add(miVertical);
             miLook.DropDownItems.Add(new ToolStripSeparator());
             miZoom = new ToolStripMenuItem("크기 (가장자리·모서리 드래그로도 조절)");
             foreach (int step in ZoomSteps)
@@ -956,6 +1284,8 @@ namespace UsageWidget
                 ToolStripMenuItem mi = it as ToolStripMenuItem;
                 if (mi != null) mi.Checked = Math.Abs((int)mi.Tag / 100f - zoom) < 0.005f;
             }
+            miHorizontal.Checked = !vertical;
+            miVertical.Checked = vertical;
             miZoom.Text = "크기 " + Math.Round(zoom * 100) + "% (가장자리·모서리 드래그로도 조절)";
         }
 
@@ -982,6 +1312,7 @@ namespace UsageWidget
                     else if (k == "sound") notifySound = v == "1";
                     else if (k == "blink") notifyBlink = v != "0";
                     else if (k == "toastzoom") { float tz; if (float.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out tz)) toastZoom = Math.Max(0.5f, Math.Min(3f, tz)); }
+                    else if (k == "layout") vertical = v == "vertical";
                     else if (k == "zoom") { float zv; if (float.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out zv)) zoom = Math.Max(ZoomMin, Math.Min(ZoomMax, zv)); }
                     else if (k == "fg") customFg = ParseHex(v);
                     else if (k == "bg") customBg = ParseHex(v);
@@ -1002,7 +1333,8 @@ namespace UsageWidget
                     + "\r\nnotify=" + (notifyOn ? "1" : "0") + "\r\nsound=" + (notifySound ? "1" : "0") + "\r\nblink=" + (notifyBlink ? "1" : "0")
                     + "\r\ntoastzoom=" + toastZoom.ToString("0.00", CultureInfo.InvariantCulture)
                     + "\r\nfg=" + ToHex(customFg) + "\r\nbg=" + ToHex(customBg) + "\r\nbgop=" + bgOpacity
-                    + "\r\nzoom=" + zoom.ToString("0.00", CultureInfo.InvariantCulture) + "\r\n");
+                    + "\r\nzoom=" + zoom.ToString("0.00", CultureInfo.InvariantCulture)
+                    + "\r\nlayout=" + (vertical ? "vertical" : "horizontal") + "\r\n");
             }
             catch { }
         }
@@ -1021,26 +1353,33 @@ namespace UsageWidget
 
         void CheckFinishedTurns()
         {
-            foreach (SessionTurn s in claudeTps.Sessions)
+            List<SessionTurn> sessions = new List<SessionTurn>(claudeTps.Sessions);
+            sessions.AddRange(codexTps.Sessions);
+            foreach (SessionTurn s in sessions)
             {
-                // Skip running turns, ones the person stopped, sessions closed mid-turn, and history.
-                if (s.End == DateTime.MinValue || s.Interrupted || s.Abandoned || s.End <= launchedAt) continue;
-                DateTime done;
-                if (notifiedTurn.TryGetValue(s.Path, out done) && done == s.Start) continue;
-                notifiedTurn[s.Path] = s.Start;
-                if ((DateTime.Now - s.End).TotalMinutes > 5) continue;
+                if (!TryMarkNotification(s, launchedAt, DateTime.Now, notifiedTurn)) continue;
                 ShowToast(s);
             }
+        }
+
+        public static bool TryMarkNotification(SessionTurn s, DateTime launched, DateTime now, HashSet<string> seen)
+        {
+            if (s.Start == DateTime.MinValue || s.End == DateTime.MinValue || s.End < s.Start
+                || s.Interrupted || s.Abandoned || s.End <= launched || s.End > now
+                || (now - s.End).TotalMinutes > 5) return false;
+            return seen.Add(s.AI + "|" + s.Path + "|" + s.Start.Ticks.ToString(CultureInfo.InvariantCulture));
         }
 
         void ShowToast(SessionTurn s)
         {
             bool light = IsLightTaskbar();
-            string title = !string.IsNullOrEmpty(s.Title) ? s.Title : (!string.IsNullOrEmpty(s.Project) ? s.Project : "Claude Code");
-            string sub = (!string.IsNullOrEmpty(s.Title) && !string.IsNullOrEmpty(s.Project) ? s.Project + " · " : "")
+            string label = !string.IsNullOrEmpty(s.SessionTitle) ? s.SessionTitle : s.Title;
+            string title = !string.IsNullOrEmpty(label) ? label : (!string.IsNullOrEmpty(s.Project) ? s.Project : s.AI);
+            string sub = (!string.IsNullOrEmpty(label) && !string.IsNullOrEmpty(s.Project) ? s.Project + " · " : "")
                 + s.End.ToString("HH:mm") + " 완료";
-            ToastForm t = new ToastForm("✓ Claude 작업 완료 · " + FmtDur(s.End - s.Start, false), title, sub,
-                customBg ?? AutoBg(light), customFg ?? AutoFg(light), Color.FromArgb(217, 119, 87), scale * toastZoom, 10, notifyBlink ? 5 : 0);
+            Color accent = s.AI == "Codex" ? Color.FromArgb(79, 142, 247) : Color.FromArgb(217, 119, 87);
+            ToastForm t = new ToastForm("✓ " + s.AI + " 작업 완료 · " + FmtDur(s.End - s.Start, false), title, sub,
+                customBg ?? AutoBg(light), customFg ?? AutoFg(light), accent, scale * toastZoom, 10, notifyBlink ? 5 : 0);
             t.FormClosed += delegate { toasts.Remove(t); LayoutToasts(); };
             toasts.Add(t);
             while (toasts.Count > 4) { ToastForm old = toasts[0]; toasts.RemoveAt(0); old.Close(); }
@@ -1072,6 +1411,7 @@ namespace UsageWidget
             claude = (claudeApi != null && claudeApi.Updated >= file.Updated) ? claudeApi : file;
             codex = Sources.ReadCodex(codexDir);
             if (showTps || notifyOn) claudeTps = Sources.ReadClaudeTps(projectsDir);
+            if ((showTps && showCodex) || notifyOn) codexTps = Sources.ReadCodexTps(codexDir);
             if (notifyOn) CheckFinishedTurns();
             Render();
         }
@@ -1111,7 +1451,7 @@ namespace UsageWidget
                 float[] textW = new float[items.Length];
                 float lh, vh, tpsW = 0, timeW = 0, valW, secGap = Z(4);
                 int boltW = Z(12), timeGap = Z(10);
-                string tpsLabel = showClaude ? "t/s" : "Claude t/s";
+                string tpsLabel = "t/s";
                 bool both = limitMode == ModeBoth;
                 using (Bitmap tmp = new Bitmap(1, 1))
                 using (Graphics mg = Graphics.FromImage(tmp))
@@ -1133,13 +1473,34 @@ namespace UsageWidget
                 // Shift for drawing small text on the same baseline as the bold value.
                 float baseShift = fValue.Size * fValue.FontFamily.GetCellAscent(fValue.Style) / fValue.FontFamily.GetEmHeight(fValue.Style)
                     - fLabel.Size * fLabel.FontFamily.GetCellAscent(fLabel.Style) / fLabel.FontFamily.GetEmHeight(fLabel.Style);
-                // Taskbar height, or taller when zoomed in far enough that the text needs it.
-                int H = Math.Max(BarHeight(), (int)Math.Ceiling(Math.Max(lh + vh - Z(3), ringD) + Z(14)));
+                // Rows of segments: horizontal puts everything on one row, vertical gives each AI
+                // its own row. A negative entry is the metrics segment of the AI before it.
+                List<List<int>> rows = new List<List<int>>();
+                for (int i = 0; i < items.Length; i++)
+                {
+                    if (vertical || rows.Count == 0) rows.Add(new List<int>());
+                    rows[rows.Count - 1].Add(i);
+                    if (showTps) rows[rows.Count - 1].Add(-i - 1);
+                }
+                // In vertical mode every AI column takes the widest text so the metrics line up.
+                float widestText = 0;
+                foreach (float w in textW) widestText = Math.Max(widestText, w);
+                float metricsW = boltW + gap + tpsW + timeGap + timeW;
 
-                float total = pad * 2 + spacing * (items.Length - 1);
-                foreach (float w in textW) total += ringD + gap + w;
-                if (showTps) total += spacing + boltW + gap + tpsW + timeGap + timeW;
+                float total = 0;
+                foreach (List<int> row in rows)
+                {
+                    float rw = pad * 2 + spacing * (row.Count - 1);
+                    foreach (int i in row) rw += i < 0 ? metricsW : ringD + gap + (vertical ? widestText : textW[i]);
+                    total = Math.Max(total, rw);
+                }
                 int W = (int)Math.Ceiling(total);
+
+                // One row: taskbar height, or taller when zoomed in far enough that the text needs it.
+                float content = Math.Max(lh + vh - Z(3), ringD);
+                int rowH = rows.Count > 1 ? (int)Math.Ceiling(content + Z(8)) : Math.Max(BarHeight(), (int)Math.Ceiling(content + Z(14)));
+                int H = rows.Count > 1 ? rowH * rows.Count + Z(10) : rowH;
+                int rowsTop = (H - rowH * rows.Count) / 2;
 
                 using (Bitmap bmp = new Bitmap(W, H, PixelFormat.Format32bppArgb))
                 {
@@ -1159,46 +1520,41 @@ namespace UsageWidget
                             using (GraphicsPath hp = RoundRect(new RectangleF(Z(2), Z(4), W - Z(4), H - Z(8)), Z(5)))
                                 g.FillPath(hb, hp);
 
-                        float x = pad;
-                        float ty = (H - (lh + vh - Z(3))) / 2f;
                         using (SolidBrush fgB = new SolidBrush(fg))
                         using (SolidBrush dimB = new SolidBrush(dim))
                         using (Pen track = new Pen(Color.FromArgb(light ? 45 : 60, fg), penW))
+                        for (int r = 0; r < rows.Count; r++)
                         {
-                            // -1 marks the t/s segment, which sits right of the Claude ring it belongs to.
-                            List<int> order = new List<int>();
-                            for (int i = 0; i < items.Length; i++)
-                            {
-                                order.Add(i);
-                                if (showTps && items[i].Name == "Claude") order.Add(-1);
-                            }
-                            if (showTps && !order.Contains(-1)) order.Add(-1);
-
-                            foreach (int i in order)
+                            float rowTop = rowsTop + r * rowH;
+                            float x = pad;
+                            float ty = rowTop + (rowH - (lh + vh - Z(3))) / 2f;
+                            foreach (int i in rows[r])
                             {
                                 if (i < 0)
                                 {
-                                    bool hasT = claudeTps.HasData;
-                                    bool fresh = hasT && (DateTime.Now - claudeTps.LastAt).TotalMinutes < 15;
-                                    Color bc = fresh ? Color.FromArgb(217, 119, 87) : Color.FromArgb(light ? 90 : 110, fg);
-                                    float bh = ringD, by = (H - bh) / 2f;
+                                    Item metricItem = items[-i - 1];
+                                    Tps metrics = metricItem.Name == "Claude" ? claudeTps : codexTps;
+                                    bool hasT = metrics.HasData;
+                                    bool fresh = hasT && (DateTime.Now - metrics.LastAt).TotalMinutes < 15;
+                                    Color bc = fresh ? metricItem.Accent : Color.FromArgb(light ? 90 : 110, fg);
+                                    float bh = ringD, by = rowTop + (rowH - bh) / 2f;
                                     PointF[] bolt = new PointF[7];
                                     float[,] pts = { { .65f, 0f }, { .12f, .58f }, { .47f, .58f }, { .35f, 1f }, { .88f, .40f }, { .53f, .40f }, { .65f, 0f } };
                                     for (int k = 0; k < 7; k++) bolt[k] = new PointF(x + pts[k, 0] * boltW, by + pts[k, 1] * bh);
                                     using (SolidBrush bb = new SolidBrush(bc)) g.FillPolygon(bb, bolt);
                                     x += boltW + gap;
 
-                                    string ttext = hasT ? FmtTps(claudeTps.Last) : "--";
+                                    string ttext = hasT ? FmtTps(metrics.Last) : "--";
                                     g.DrawString(tpsLabel, fLabel, dimB, x - Z(1), ty);
                                     g.DrawString(ttext, fValue, fresh || !hasT ? fgB : dimB, x - Z(1), ty + lh - Z(3));
                                     x += tpsW + timeGap;
 
                                     // Turn time like tps-meter: live while running, total once done.
-                                    Tps tt = claudeTps;
+                                    Tps tt = metrics;
                                     bool active = tt.TurnActive;
                                     bool turnFresh = active || (tt.HasTurn && (DateTime.Now - tt.TurnEnd).TotalMinutes < 15);
                                     string dtext = tt.HasTurn ? FmtDur((active ? DateTime.Now : tt.TurnEnd) - tt.TurnStart, active) : "--";
-                                    using (SolidBrush ab = new SolidBrush(Color.FromArgb(217, 119, 87)))
+                                    using (SolidBrush ab = new SolidBrush(metricItem.Accent))
                                         g.DrawString(active ? "작업 중" : "작업시간", fLabel, active ? ab : dimB, x - Z(1), ty);
                                     g.DrawString(dtext, fValue, turnFresh || !tt.HasTurn ? fgB : dimB, x - Z(1), ty + lh - Z(3));
                                     x += timeW + spacing;
@@ -1212,7 +1568,7 @@ namespace UsageWidget
                                 double val = has ? (showUsed ? used : remain) : 0;
                                 Color c = (has && remain <= 15) ? Color.FromArgb(229, 72, 77) : items[i].Accent;
 
-                                RectangleF rr = new RectangleF(x + penW / 2f, (H - ringD) / 2f + penW / 2f, ringD - penW, ringD - penW);
+                                RectangleF rr = new RectangleF(x + penW / 2f, rowTop + (rowH - ringD) / 2f + penW / 2f, ringD - penW, ringD - penW);
                                 g.DrawEllipse(track, rr);
                                 if (has && val > 0.5)
                                     using (Pen p = new Pen(c, penW))
@@ -1238,7 +1594,7 @@ namespace UsageWidget
                                     using (SolidBrush wb = new SolidBrush(wc))
                                         g.DrawString(wtext, fLabel, wb, x - Z(1) + valW + secGap, ty + lh - Z(3) + baseShift);
                                 }
-                                x += textW[i] + spacing;
+                                x += (vertical ? widestText : textW[i]) + spacing;
                             }
                         }
                     }
@@ -1338,15 +1694,13 @@ namespace UsageWidget
             sb.AppendLine();
         }
 
-        void TpsLines(StringBuilder sb)
+        void TpsLines(StringBuilder sb, Tps t)
         {
-            Tps t = claudeTps;
             if (!t.HasData)
             {
                 sb.AppendLine("  출력 속도: 데이터 없음 (최근 24시간 내 응답 없음)");
-                return;
             }
-            sb.AppendLine("  출력 속도: " + FmtTps(t.Last) + " t/s (" + t.LastTokens.ToString("N0", CultureInfo.InvariantCulture)
+            else sb.AppendLine("  출력 속도: " + FmtTps(t.Last) + " t/s (" + t.LastTokens.ToString("N0", CultureInfo.InvariantCulture)
                 + " 토큰 / " + t.LastSecs.ToString("0.0", CultureInfo.InvariantCulture) + "초) · " + Ago(t.LastAt));
             if (t.Avg >= 0)
                 sb.AppendLine("  최근 " + Tps.AvgMinutes + "분 평균: " + FmtTps(t.Avg) + " t/s (" + t.AvgCount + "건)");
@@ -1377,13 +1731,7 @@ namespace UsageWidget
                     Line(sb, "5시간", u.Short, now);
                     Line(sb, "주간", u.Week, now);
                 }
-                if (showTps && it.Name == "Claude") TpsLines(sb);
-                sb.AppendLine();
-            }
-            if (showTps && !showClaude)
-            {
-                sb.AppendLine("Claude 출력 속도");
-                TpsLines(sb);
+                if (showTps) TpsLines(sb, it.Name == "Claude" ? claudeTps : codexTps);
                 sb.AppendLine();
             }
             sb.Append("드래그: 이동 · 가장자리·모서리 드래그: 크기 · 우클릭: 메뉴");
@@ -1497,6 +1845,7 @@ namespace UsageWidget
 
         public ToastForm(string head, string title, string sub, Color bg, Color fg, Color accent, float px, int seconds, int blinks)
         {
+            Text = head;
             this.head = head;
             this.title = title;
             this.sub = sub;
