@@ -149,27 +149,20 @@ namespace UsageWidget
             try
             {
                 if (!File.Exists(credentialsPath)) return null;
-                string oauth = Obj(File.ReadAllText(credentialsPath), "claudeAiOauth");
-                if (oauth == null) return null;
-                Match tok = Regex.Match(oauth, "\"accessToken\"\\s*:\\s*\"([^\"]+)\"");
-                if (!tok.Success) return null;
-                double exp = Num(oauth, "expiresAt");
-                // Expired: wait for Claude Code to refresh it rather than touching the refresh token.
-                if (exp > 0 && exp <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) return null;
+                string token = ClaudeAccessToken(credentialsPath, false);
+                if (token == null) return null;
 
-                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://api.anthropic.com/api/oauth/usage");
-                req.Method = "GET";
-                req.Timeout = 10000;
-                req.ReadWriteTimeout = 10000;
-                req.UserAgent = "claude-code/usage-widget";
-                req.Accept = "application/json";
-                req.Headers["Authorization"] = "Bearer " + tok.Groups[1].Value;
-                req.Headers["anthropic-beta"] = "oauth-2025-04-20";
                 string text;
-                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
-                using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                    text = sr.ReadToEnd();
+                try { text = GetUsage(token); }
+                catch (WebException ex)
+                {
+                    HttpWebResponse r = ex.Response as HttpWebResponse;
+                    if (r == null || r.StatusCode != HttpStatusCode.Unauthorized) throw;
+                    // Revoked or expired early: refresh once and retry.
+                    token = ClaudeAccessToken(credentialsPath, true);
+                    if (token == null) return null;
+                    text = GetUsage(token);
+                }
 
                 Usage u = new Usage();
                 u.Short = Parse(Obj(text, "five_hour"), "utilization");
@@ -179,6 +172,115 @@ namespace UsageWidget
                 return u;
             }
             catch { return null; }
+        }
+
+        static string GetUsage(string token)
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://api.anthropic.com/api/oauth/usage");
+            req.Method = "GET";
+            req.Timeout = 10000;
+            req.ReadWriteTimeout = 10000;
+            req.UserAgent = "claude-code/usage-widget";
+            req.Accept = "application/json";
+            req.Headers["Authorization"] = "Bearer " + token;
+            req.Headers["anthropic-beta"] = "oauth-2025-04-20";
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                return sr.ReadToEnd();
+        }
+
+        // Claude Code's own OAuth client; the widget refreshes exactly as Claude Code does.
+        const string OAuthTokenUrl = "https://platform.claude.com/v1/oauth/token";
+        const string OAuthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+        static DateTime refreshBlockedUntil = DateTime.MinValue;
+
+        static long ToLong(object v)
+        {
+            long n;
+            return v != null && long.TryParse(Convert.ToString(v, CultureInfo.InvariantCulture), NumberStyles.Integer, CultureInfo.InvariantCulture, out n) ? n : 0;
+        }
+
+        // Only the desktop app is used for days at a time, so nothing else refreshes the CLI login
+        // stored in .credentials.json. Refresh it when expired and write it back so Claude Code
+        // keeps working with the rotated refresh token.
+        static string ClaudeAccessToken(string credentialsPath, bool force)
+        {
+            Dictionary<string, object> root = json.DeserializeObject(File.ReadAllText(credentialsPath)) as Dictionary<string, object>;
+            Dictionary<string, object> o = Map(root, "claudeAiOauth");
+            if (o == null) return null;
+            string access = Str(o, "accessToken");
+            object expObj;
+            long exp = o.TryGetValue("expiresAt", out expObj) ? ToLong(expObj) : 0;
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (!force && access != null && (exp == 0 || exp > nowMs + 60000)) return access;
+
+            string refresh = Str(o, "refreshToken");
+            // A failed refresh (e.g. signed out) is not retried every poll.
+            if (refresh == null || DateTime.UtcNow < refreshBlockedUntil) return null;
+
+            object scopesObj;
+            List<string> scopes = new List<string>();
+            if (o.TryGetValue("scopes", out scopesObj) && scopesObj is object[])
+                foreach (object s in (object[])scopesObj) if (s is string) scopes.Add((string)s);
+
+            Dictionary<string, object> body = new Dictionary<string, object>();
+            body["grant_type"] = "refresh_token";
+            body["refresh_token"] = refresh;
+            body["client_id"] = OAuthClientId;
+            if (scopes.Count > 0) body["scope"] = string.Join(" ", scopes.ToArray());
+
+            string respText;
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(OAuthTokenUrl);
+                req.Method = "POST";
+                req.Timeout = 10000;
+                req.ReadWriteTimeout = 10000;
+                req.ContentType = "application/json";
+                req.Accept = "application/json";
+                req.UserAgent = "claude-code/usage-widget";
+                byte[] payload = Encoding.UTF8.GetBytes(json.Serialize(body));
+                using (Stream s = req.GetRequestStream()) s.Write(payload, 0, payload.Length);
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    respText = sr.ReadToEnd();
+            }
+            catch
+            {
+                refreshBlockedUntil = DateTime.UtcNow.AddMinutes(10);
+                return null;
+            }
+
+            Dictionary<string, object> r = json.DeserializeObject(respText) as Dictionary<string, object>;
+            string newAccess = Str(r, "access_token");
+            if (newAccess == null) { refreshBlockedUntil = DateTime.UtcNow.AddMinutes(10); return null; }
+            object expiresIn;
+            long lifetime = r.TryGetValue("expires_in", out expiresIn) ? ToLong(expiresIn) : 0;
+
+            string updated = ApplyRefresh(File.ReadAllText(credentialsPath), refresh, newAccess, Str(r, "refresh_token"),
+                lifetime > 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + lifetime * 1000 : 0);
+            if (updated != null)
+            {
+                string tmp = credentialsPath + ".widget.tmp";
+                File.WriteAllText(tmp, updated, new UTF8Encoding(false));
+                File.Replace(tmp, credentialsPath, null);
+            }
+            return newAccess;
+        }
+
+        // New .credentials.json text with only the three token fields replaced, or null when the
+        // file no longer holds the refresh token that was used (another client refreshed first).
+        public static string ApplyRefresh(string fileText, string usedRefresh, string access, string refresh, long expiresAtMs)
+        {
+            Dictionary<string, object> root = json.DeserializeObject(fileText) as Dictionary<string, object>;
+            Dictionary<string, object> o = Map(root, "claudeAiOauth");
+            if (o == null || Str(o, "refreshToken") != usedRefresh) return null;
+            o["accessToken"] = access;
+            if (!string.IsNullOrEmpty(refresh)) o["refreshToken"] = refresh;
+            if (expiresAtMs > 0) o["expiresAt"] = expiresAtMs;
+            return json.Serialize(root);
         }
 
         static string[] Desc(string[] a)

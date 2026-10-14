@@ -143,6 +143,22 @@ public static class CodexMetricsTests
                 Check(Sources.ReadCodexTps(nameLogs).Sessions[0].SessionTitle == "바꾼 세션명", "rename reflected even when transcript is cached");
                 File.Delete(index);
                 Check(Sources.ReadCodexTps(nameLogs).Sessions[0].SessionTitle == null, "missing index clears stale sidebar title");
+            // Token refresh write-back, on fake credentials only.
+            string creds = "{\"mcpOAuth\":{\"srv|1\":{\"accessToken\":\"mcp-a\",\"expiresAt\":1}},"
+                + "\"claudeAiOauth\":{\"accessToken\":\"old-a\",\"refreshToken\":\"old-r\",\"expiresAt\":1000,"
+                + "\"scopes\":[\"user:profile\",\"user:inference\"],\"subscriptionType\":\"max\"}}";
+            Dictionary<string, object> updated = json.DeserializeObject(
+                Sources.ApplyRefresh(creds, "old-r", "new-a", "new-r", 5000)) as Dictionary<string, object>;
+            Dictionary<string, object> cao = (Dictionary<string, object>)updated["claudeAiOauth"];
+            Check((string)cao["accessToken"] == "new-a" && (string)cao["refreshToken"] == "new-r"
+                && Convert.ToInt64(cao["expiresAt"]) == 5000, "refresh replaces the three token fields");
+            Check((string)cao["subscriptionType"] == "max" && ((object[])cao["scopes"]).Length == 2
+                && (string)((Dictionary<string, object>)((Dictionary<string, object>)updated["mcpOAuth"])["srv|1"])["accessToken"] == "mcp-a",
+                "refresh keeps other credential fields");
+            cao = (Dictionary<string, object>)((Dictionary<string, object>)json.DeserializeObject(
+                Sources.ApplyRefresh(creds, "old-r", "new-a", null, 0)))["claudeAiOauth"];
+            Check((string)cao["refreshToken"] == "old-r" && Convert.ToInt64(cao["expiresAt"]) == 1000, "refresh without rotation keeps refresh token");
+            Check(Sources.ApplyRefresh(creds, "other-r", "new-a", "new-r", 5000) == null, "refresh never overwrites a newer login");
             if (args.Length > 0)
             {
                 t = Sources.ReadCodexTps(args[0]);
